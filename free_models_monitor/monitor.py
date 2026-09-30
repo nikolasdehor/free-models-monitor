@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Portable monitor for free-tier LLM models across providers.
 
-Tracks free models (OpenRouter, Groq) between runs, reports what was added
+Tracks zero-priced OpenRouter models and manual Groq candidates between runs,
+reports what was added
 or removed, suggests a fallback per a preference chain, and can notify
 Telegram/Discord/Slack/a generic webhook. Works standalone via cron or as
 an agent skill in any harness, see SKILL.md at the repo root.
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 from free_models_monitor import notify as notify_mod
 from free_models_monitor.providers import (
     DEFAULT_FALLBACK_CHAIN,
+    GROQ_CATALOG_METADATA,
     fetch_groq_free,
     fetch_openrouter_free,
 )
@@ -132,6 +134,8 @@ def find_best_fallback(
     exclude = (
         {exclude_model, denormalize_model_id(exclude_model)} if exclude_model else set()
     )
+    current = {mid: info for mid, info in current.items()
+               if info.get("free_tier_verified", True)}
     for model_id in fallback_chain:
         if model_id in exclude or model_id in banned:
             continue
@@ -171,7 +175,7 @@ def build_report_text(changes, affected_by_model, switches, now_label):
         if change["type"] == "removed":
             lines += [
                 "",
-                "Model REMOVED from free tier:",
+                "Model REMOVED from " + ("manual Groq catalog:" if mid.startswith("groq/") else "free tier:"),
                 f"  - {mid} ({info.get('name', mid)})",
             ]
             for a in affected_by_model.get(mid, []):
@@ -185,14 +189,14 @@ def build_report_text(changes, affected_by_model, switches, now_label):
             ctx = info.get("context_length", 0)
             lines += [
                 "",
-                "Model ADDED to free tier:",
+                "Model ADDED to " + ("manual Groq catalog:" if mid.startswith("groq/") else "free tier:"),
                 f"  + {mid} ({info.get('name', mid)}, ctx={ctx})",
             ]
     return "\n".join(lines)
 
 
 def compute_diff(
-    current, snapshot, scan_dirs, fallback_chain, banned, min_context, history
+    current, snapshot, scan_dirs, fallback_chain, banned, min_context, history, fallback_current=None
 ):
     """Diffs current against the previous snapshot, updating history in place."""
     normalized_snapshot = {
@@ -212,7 +216,8 @@ def compute_diff(
         history = add_history_entry(history, "removed", mid, info)
         affected_by_model[mid] = find_agents_using_model(mid, scan_dirs)
         fb_id, fb_info = find_best_fallback(
-            current, fallback_chain, banned, exclude_model=mid, min_context=min_context
+            current if fallback_current is None else fallback_current,
+            fallback_chain, banned, exclude_model=mid, min_context=min_context
         )
         if fb_id:
             switches.append(
@@ -249,80 +254,95 @@ def parse_args(argv=None):
     p.add_argument("--notify-always", action="store_true")
     p.add_argument("--init", action="store_true")
     p.add_argument("--fallback-chain-file", default=None)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    selected = {name.strip() for name in args.providers.split(",") if name.strip()}
+    if not selected or selected - {"openrouter", "groq"}:
+        p.error("--providers must select openrouter and/or groq")
+    return args
+
+
+def reconcile_providers(current, counts, snapshot, providers):
+    """Retain unavailable/disabled providers; successful empty catalogs replace cache."""
+    preserved = {
+        normalize_model_id(mid): info for mid, info in snapshot.items()
+        if normalize_model_id(mid).split("/", 1)[0] not in counts
+    }
+    status = {}
+    for provider in sorted(providers):
+        if provider in counts:
+            status[provider] = "fresh" if provider != "groq" else "static_unverified"
+        else:
+            cached = any(mid.startswith(provider + "/") for mid in preserved)
+            status[provider] = "cached" if cached else "unavailable"
+    return {**preserved, **current}, status
+
+
+def render_report(args, changes, affected, switches, counts, status, errors, now, size, initialized):
+    if args.format == "json":
+        return json.dumps({
+            "changed": bool(changes), "changes": changes, "affected_configs": affected,
+            "switches": switches, "provider_counts": counts, "provider_status": status,
+            "complete": not errors, "errors": errors, "initialized": initialized,
+            "catalog_metadata": {"groq": GROQ_CATALOG_METADATA} if "groq" in status else {},
+        }, indent=2, ensure_ascii=False)
+    if initialized:
+        report = f"free-models-monitor: initialized with {size} catalog entries ({now})"
+    elif changes:
+        report = build_report_text(changes, affected, switches, now)
+    else:
+        report = f"free-models-monitor: no observed changes ({now}). {size} catalog entries tracked."
+    if "groq" in status:
+        report += ("\nGroq: manual legacy candidates; availability/free-tier eligibility "
+                   "unverified (reviewed 2026-09-30).")
+    if errors:
+        report += "\nINCOMPLETE: failed providers retained from cache where available; see errors."
+    return report
+
+
+def collect_check(args, state_dir):
+    snapshot_path = os.path.join(state_dir, "snapshot.json")
+    history_path = os.path.join(state_dir, "history.json")
+    providers = {p.strip() for p in args.providers.split(",") if p.strip()}
+    banned = load_banned_models(state_dir)
+    chain = load_fallback_chain(args.fallback_chain_file)
+    snapshot = load_json_safe(snapshot_path, {})
+    history = load_json_safe(history_path, {"changes": []})
+    fresh, counts, errors = fetch_current_models(providers, banned)
+    current, status = reconcile_providers(fresh, counts, snapshot, providers)
+    initialized = args.init or not os.path.exists(snapshot_path)
+    if initialized:
+        changes, affected, switches = [], {}, []
+        if counts:
+            history = add_history_entry(history, "init", "all", {"count": len(current)})
+    else:
+        # Cached and unverified candidates must never be suggested as confirmed fallbacks.
+        fallback = {mid: info for mid, info in fresh.items()
+                    if not mid.startswith("groq/") or info.get("free_tier_verified", True)}
+        changes, affected, switches, history = compute_diff(
+            current, snapshot, args.scan_dir, chain, banned, args.min_context, history,
+            fallback_current=fallback,
+        )
+    if counts:
+        save_json_safe(snapshot_path, current)
+        save_json_safe(history_path, history)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    report = render_report(args, changes, affected, switches, counts, status, errors,
+                           now, len(current), initialized)
+    return report, bool(changes), errors
 
 
 def main(argv=None):
     args = parse_args(argv)
-    state_dir = args.state_dir or default_state_dir()
-    snapshot_path = os.path.join(state_dir, "snapshot.json")
-    history_path = os.path.join(state_dir, "history.json")
-
-    providers = {p.strip() for p in args.providers.split(",") if p.strip()}
-    banned = load_banned_models(state_dir)
-    fallback_chain = load_fallback_chain(args.fallback_chain_file)
-
-    current, counts, errors = fetch_current_models(providers, banned)
-    if errors and not current:
-        for err in errors:
-            print(f"ERROR: {err}", file=sys.stderr)
-        return 1
-
-    snapshot = load_json_safe(snapshot_path, {})
-    history = load_json_safe(history_path, {"changes": []})
-    now_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    if args.init or not snapshot:
-        save_json_safe(snapshot_path, current)
-        save_json_safe(
-            history_path,
-            add_history_entry(history, "init", "all", {"count": len(current)}),
-        )
-        print(
-            f"free-models-monitor: initialized with {len(current)} free models ({now_label})"
-        )
-        return 0
-
-    changes, affected_by_model, switches, history = compute_diff(
-        current,
-        snapshot,
-        args.scan_dir,
-        fallback_chain,
-        banned,
-        args.min_context,
-        history,
-    )
-    save_json_safe(snapshot_path, current)
-    save_json_safe(history_path, history)
-
-    changed = bool(changes)
-    if args.format == "json":
-        report = json.dumps(
-            {
-                "changed": changed,
-                "changes": changes,
-                "affected_configs": affected_by_model,
-                "switches": switches,
-                "provider_counts": counts,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-    elif changed:
-        report = build_report_text(changes, affected_by_model, switches, now_label)
-    else:
-        report = f"free-models-monitor: no changes ({now_label}). {len(current)} free models tracked."
-
+    report, changed, errors = collect_check(args, args.state_dir or default_state_dir())
     print(report)
     for err in errors:
         print(f"WARNING: {err}", file=sys.stderr)
-
-    if args.notify != "none" and (changed or args.notify_always):
+    # An incomplete check is an error even if a healthy provider changed.
+    if not errors and args.notify != "none" and (changed or args.notify_always):
         ok, notify_err = notify_mod.notify(args.notify, report)
         if not ok:
             print(f"WARNING: notify failed: {notify_err}", file=sys.stderr)
-
-    return 2 if changed else 0
+    return 1 if errors else (2 if changed else 0)
 
 
 if __name__ == "__main__":

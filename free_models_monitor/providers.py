@@ -1,10 +1,12 @@
-"""Provider adapters: fetch free-tier model catalogs.
+"""Provider adapters: zero-priced catalogs and unverified legacy candidates.
 
 Add a new provider by writing a fetch_<name>_free() -> (dict, error)
 function below and registering it in PROVIDERS. monitor.py only calls
 functions from here, it never talks to a provider API directly.
 """
+import copy
 import json
+import math
 import urllib.error
 import urllib.request
 
@@ -25,9 +27,15 @@ DEFAULT_FALLBACK_CHAIN = [
     "groq/llama-3.3-70b-versatile",
 ]
 
-# Groq has no public "free tier" catalog endpoint, so this list is
-# maintained by hand. Edit it if Groq changes its free lineup, or pass
-# your own --fallback-chain-file if you only care about fallback order.
+# Legacy manual candidates, NOT a verified current/free catalog.
+# Groq's authenticated /models endpoint lists active models, not free eligibility.
+GROQ_CATALOG_METADATA = {
+    "source": "legacy_manual_candidates", "reviewed_at": "2026-09-30",
+    "catalog_as_of": None, "free_tier_verified": False,
+    "models_docs": "https://console.groq.com/docs/models",
+    "rate_limits_docs": "https://console.groq.com/docs/rate-limits",
+    "note": "Original catalog date unknown; may include retired models. Active does not imply free.",
+}
 GROQ_FREE_MODELS = {
     "groq/llama-3.3-70b-versatile": {
         "name": "Llama 3.3 70B Versatile (Groq)",
@@ -62,26 +70,43 @@ def fetch_openrouter_free(timeout=15):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeError, OSError) as e:
         return None, f"OpenRouter fetch error: {e}"
 
-    free = {}
-    for m in payload.get("data", []):
-        mid = m.get("id", "")
-        pricing = m.get("pricing", {})
-        if _is_free_price(pricing.get("prompt")) and _is_free_price(
-            pricing.get("completion")
-        ):
-            free[mid] = {
-                "name": m.get("name", mid),
-                "context_length": m.get("context_length", 0) or 0,
-            }
-    return free, None
+    try:
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("expected data list")
+        free = {}
+        for m in payload["data"]:
+            if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not m["id"]:
+                raise ValueError("invalid model entry")
+            pricing = m.get("pricing")
+            if not isinstance(pricing, dict) or not {"prompt", "completion"} <= pricing.keys():
+                raise ValueError("missing model pricing")
+            for price in (pricing["prompt"], pricing["completion"]):
+                if isinstance(price, bool) or not math.isfinite(float(price)) or float(price) < 0:
+                    raise ValueError("invalid model pricing")
+            context = m.get("context_length", 0) or 0
+            if not isinstance(context, int) or isinstance(context, bool) or context < 0:
+                raise ValueError("invalid context length")
+            if _is_free_price(pricing["prompt"]) and _is_free_price(pricing["completion"]):
+                free[m["id"]] = {
+                    "name": m.get("name", m["id"]),
+                    "context_length": m.get("context_length", 0) or 0,
+                }
+        return free, None
+    except (TypeError, ValueError) as e:
+        return None, f"OpenRouter catalog error: {e}"
 
 
 def fetch_groq_free():
-    """Returns Groq's free model list (static, see GROQ_FREE_MODELS)."""
-    return dict(GROQ_FREE_MODELS), None
+    """Compatibility API: legacy candidates, never proof of free eligibility."""
+    return copy.deepcopy(GROQ_FREE_MODELS), None
+
+
+for _info in GROQ_FREE_MODELS.values():
+    _info.update({"source": "legacy_manual_candidates", "free_tier_verified": False,
+                  "catalog_as_of": None, "reviewed_at": "2026-09-30"})
 
 
 PROVIDERS = {

@@ -1,6 +1,6 @@
 ---
 name: free-models-monitor
-description: Checks whether free-tier LLM models on OpenRouter and Groq were added or removed since the last run, and helps decide what to do about it (notify, suggest a fallback, or apply a config swap). Use whenever the user asks to check free model status, run the model monitor, or handle a model that stopped being free.
+description: Checks whether zero-priced OpenRouter models and legacy manual Groq candidates were added or removed since the last run, and helps decide what to do about it (notify, suggest a fallback, or apply a config swap). Use whenever the user asks to check free model status, run the model monitor, or handle a model that stopped being free.
 ---
 
 # free-models-monitor
@@ -30,10 +30,12 @@ Read the exit code before reading the output:
 
 - `0`: nothing changed. Nothing else to do.
 - `2`: something changed. Read the JSON body.
-- `1`: the check itself failed (network error, bad state dir). Report the
+- `1`: the check failed or is incomplete (including partial provider failure) (network error, bad state dir). Report the
   stderr message to the user; do not treat this as "no free models".
 
 ## 2. Interpret the output
+
+Read `complete`, `errors`, `provider_status` and `catalog_metadata` first. An incomplete check returns 1, retains failed providers from cache, and suppresses notifications. Cached/unverified Groq candidates are not confirmed available/free fallbacks. See `docs/catalog-reliability.md`.
 
 With `--format json` the body has:
 

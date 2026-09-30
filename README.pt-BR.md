@@ -1,6 +1,6 @@
 # free-models-monitor
 
-Monitora modelos de LLM gratuitos no OpenRouter e na Groq, avisa quando um
+Monitora modelos de preço zero no OpenRouter e candidatos manuais legados da Groq, avisa quando um
 modelo é adicionado ou removido, e sugere (ou aplica) uma troca de
 fallback. Funciona sozinho via cron, ou como skill de qualquer harness de
 agente.
@@ -36,8 +36,8 @@ config inválida).
 
 - Busca o catálogo de modelos do OpenRouter (`/api/v1/models`) e mantém só
   os que têm preço zero em prompt e em completion.
-- Junta uma lista estática pequena de modelos gratuitos da Groq
-  (`free_models_monitor/providers.py`, edite se a Groq mudar a lista).
+- Inclui candidatos manuais legados da Groq com metadados de incerteza;
+  esses candidatos não são sugeridos automaticamente como fallback.
 - Compara com o último snapshot (`~/.free-models-monitor/snapshot.json` por
   padrão) e reporta adições e remoções.
 - Mantém um histórico com limite de 200 entradas de cada mudança
@@ -124,3 +124,7 @@ English: see [README.md](README.md).
 ## Licença
 
 MIT, veja [LICENSE](LICENSE).
+
+## Provider failures and catalog provenance
+
+See [catalog reliability](docs/catalog-reliability.md) for partial failures, cache behavior, exit codes, JSON fields and Groq limits.
